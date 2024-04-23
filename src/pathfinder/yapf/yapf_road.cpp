@@ -11,6 +11,7 @@
 #include "yapf.hpp"
 #include "yapf_node_road.hpp"
 #include "../../roadstop_base.h"
+#include "../../vehicle_func.h"
 
 #include "../../safeguards.h"
 
@@ -54,6 +55,44 @@ protected:
 		return 0;
 	}
 
+	struct TileDataHelper
+	{
+		TileIndex tile;        ///< The tile we are working on.
+		DiagDirection dir;     ///< The direction the tile is oriented following Trackdir.
+		uint free = TILE_SIZE;
+	};
+
+	/* Find the amount of free space in this tile, measured from the direction of entry. */
+	static Vehicle *FindBlockingVehiclesInTile(Vehicle *v, void *data)
+	{
+		TileDataHelper *tdh = (TileDataHelper*)data;
+
+		/* Exclude if not a RV, not travelling in the Trackdir direction */
+		if (v->type != VEH_ROAD || DirToDiagDir(v->direction) != tdh->dir) return nullptr;
+
+		RoadVehicle *rv = RoadVehicle::From(v);
+
+		uint veh_pos = DiagDirToAxis(tdh->dir) == AXIS_X ? rv->x_pos : rv->y_pos;
+		uint tile_pos = DiagDirToAxis(tdh->dir) == AXIS_X ? TileX(tdh->tile) : TileY(tdh->tile);
+		uint tile_free_space = TILE_SIZE;
+
+		switch (tdh->dir) {
+			case DIAGDIR_NE:
+			case DIAGDIR_NW:
+				tile_free_space = veh_pos % tile_pos < TILE_SIZE / 2 ? TILE_SIZE / 2 : 0;
+				tdh->free = std::min(tdh->free, tile_free_space);
+				break;
+			case DIAGDIR_SE:
+			case DIAGDIR_SW:
+				tile_free_space = veh_pos % tile_pos < TILE_SIZE / 2 ? 0 : TILE_SIZE / 2;
+				tdh->free = std::min(tdh->free, tile_free_space);
+				break;
+			default:
+				return nullptr;
+		}
+		return nullptr;
+	}
+
 	/** return one tile cost */
 	inline int OneTileCost(TileIndex tile, Trackdir trackdir)
 	{
@@ -68,18 +107,34 @@ protected:
 						cost += Yapf().PfGetSettings().road_crossing_penalty;
 					}
 					break;
-
 				case MP_STATION: {
 					const RoadStop *rs = RoadStop::GetByTile(tile, GetRoadStopType(tile));
 					if (IsDriveThroughStopTile(tile)) {
 						/* Increase the cost for drive-through road stops */
 						cost += Yapf().PfGetSettings().road_stop_penalty;
-						DiagDirection dir = TrackdirToExitdir(trackdir);
-						if (!RoadStop::IsDriveThroughRoadStopContinuation(tile, tile - TileOffsByDiagDir(dir))) {
-							/* When we're the first road stop in a 'queue' of them we increase
-							 * cost based on the fill percentage of the whole queue. */
+
+						/* It is the vehicle's destination road stop.
+						   Calculate the occupancy level and penalty level */
+						if (Yapf().PfDetectDestinationTile(tile, trackdir)) {
+
+							DiagDirection dir = TrackdirToExitdir(trackdir);
 							const RoadStop::Entry *entry = rs->GetEntry(dir);
-							cost += entry->GetOccupied() * Yapf().PfGetSettings().road_stop_occupied_penalty / entry->GetLength();
+
+							TileDataHelper tdh;
+							tdh.dir = dir;
+
+							int free = 0;
+							TileIndexDiff offset = TileOffsByDiagDir(dir);
+
+							for (TileIndex rs_tile = rs->xy; RoadStop::IsDriveThroughRoadStopContinuation(rs->xy, rs_tile); rs_tile += offset) {
+								tdh.tile = rs_tile;
+								FindVehicleOnPos(rs_tile, &tdh, &FindBlockingVehiclesInTile);
+								free += tdh.free;
+
+								// Tile contains a vehicle - no need to keep calculating.
+								if (tdh.free < TILE_SIZE) break;
+							};
+							cost += (entry->GetLength() - free) * Yapf().PfGetSettings().road_stop_occupied_penalty / entry->GetLength();
 						}
 					} else {
 						/* Increase cost for filled road stops */
